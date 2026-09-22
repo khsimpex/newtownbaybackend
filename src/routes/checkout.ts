@@ -11,7 +11,9 @@ import {
 } from "../services/checkoutService.js";
 
 export async function checkoutRoutes(app: FastifyInstance) {
-  app.post("/checkout/reserve", async (request, reply) => {
+  // Tighter than the global 60/min: each call locks real stock and creates a
+  // Razorpay order, so a loop here can exhaust inventory.
+  app.post("/checkout/reserve", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request, reply) => {
     const parsed = reserveRequestSchema.safeParse(request.body);
 
     if (!parsed.success) {

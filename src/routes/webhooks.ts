@@ -17,7 +17,9 @@ function verifySignature(rawBody: string, signature: string): boolean {
 }
 
 export async function webhookRoutes(app: FastifyInstance) {
-  app.post("/webhooks/payment", async (request, reply) => {
+  // No rate limit: Razorpay retries deliveries, and throttling them drops
+  // payment events. Auth is the HMAC below, not a request budget.
+  app.post("/webhooks/payment", { config: { rateLimit: false } }, async (request, reply) => {
     // rawBody is attached by the content-type parser registered in
     // server.ts â€” HMAC verification MUST run over the exact raw bytes,
     // never the re-serialized parsed JSON object.

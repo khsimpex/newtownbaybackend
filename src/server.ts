@@ -27,7 +27,13 @@ app.addContentTypeParser(
       const json = str.length ? JSON.parse(str) : {};
       done(null, json);
     } catch (err) {
-      done(err as Error, undefined);
+      // Malformed input is a client error, not a server fault. Fastify would
+      // otherwise default to 500 and echo the parser's internals to the caller.
+      // Razorpay also retries on 5xx, so a bad webhook delivery must not 500.
+      req.log.warn({ err }, "Rejected malformed JSON body");
+      const badRequest = new Error("Malformed JSON body") as Error & { statusCode: number };
+      badRequest.statusCode = 400;
+      done(badRequest, undefined);
     }
   }
 );
@@ -54,18 +60,6 @@ app.post(
     return reply.send(result);
   }
 );
-
-app.addHook("onRoute", (routeOptions) => {
-  if (routeOptions.url === "/webhooks/payment") {
-    routeOptions.config = { ...routeOptions.config, rateLimit: false };
-  }
-  if (routeOptions.url === "/checkout/reserve") {
-    routeOptions.config = {
-      ...routeOptions.config,
-      rateLimit: { max: 10, timeWindow: "1 minute" },
-    };
-  }
-});
 
 app
   .listen({ port: env.PORT, host: "0.0.0.0" })
