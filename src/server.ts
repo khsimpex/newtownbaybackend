@@ -9,25 +9,14 @@ import { sweepExpiredReservations } from "./services/expirySweep.js";
 
 const app = Fastify({ logger: true });
 
-// Security headers. Default config is fine for a JSON API — no CSP tuning
-// needed since this service never serves HTML.
 await app.register(helmet);
 
-// Global default rate limit. Individual routes below override this with
-// tighter or looser config as appropriate — a single blanket number is
-// wrong here: /checkout/reserve should be tight (one person has no
-// legitimate reason to hit it 60x/min), while /webhooks/payment must NOT
-// be throttled by IP, since Razorpay can legitimately burst-deliver many
-// webhooks in the same minute during a successful drop.
 await app.register(rateLimit, {
   global: true,
   max: 60,
   timeWindow: "1 minute",
 });
 
-// Capture the raw request body alongside the parsed JSON. The webhook and
-// sweep routes need the exact raw bytes / exact header comparison — see
-// individual route files for how this is used.
 app.addContentTypeParser(
   "application/json",
   { parseAs: "string" },
@@ -53,12 +42,6 @@ app.get("/health", async () => ({ status: "ok" }));
 await app.register(checkoutRoutes);
 await app.register(webhookRoutes);
 
-// ---------------------------------------------------------------------------
-// Internal expiry sweep — called by an external scheduler (Railway cron,
-// cron-job.org, etc.), never by the storefront or a customer. Protected by
-// a shared secret header, and exempt from the global IP rate limit since
-// the scheduler is a trusted, known caller hitting it on its own schedule.
-// ---------------------------------------------------------------------------
 app.post(
   "/internal/sweep-expired",
   { config: { rateLimit: false } },
@@ -72,9 +55,6 @@ app.post(
   }
 );
 
-// Explicitly exempt the payment webhook from the global rate limit —
-// Razorpay is the only caller (verified by HMAC signature), and throttling
-// it by IP risks dropping legitimate webhook deliveries during a busy drop.
 app.addHook("onRoute", (routeOptions) => {
   if (routeOptions.url === "/webhooks/payment") {
     routeOptions.config = { ...routeOptions.config, rateLimit: false };
