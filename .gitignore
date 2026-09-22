@@ -1,5 +1,7 @@
 # Environment files
 .env
+.env.*
+!.env.example
 .env*.local
 .env.production
 .env.staging
@@ -13,4 +15,33 @@ build/
 
 # Logs
 *.log
+
+# Cloud / deployment config and secrets
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+.vercel/
+.netlify/
+serverless.yml
+serverless.ts
+cloudformation.yml
+*.kubeconfig
+
+# Docker / local overrides
+.docker/
+docker-compose.override.yml
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
