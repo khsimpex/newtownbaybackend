@@ -45,3 +45,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local agent tooling (strix skills, machine-local settings)
+.claude/settings.local.json
+.claude/skills/
+.agents/
+skills-lock.json
+
