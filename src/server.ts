@@ -5,6 +5,7 @@ import helmet from "@fastify/helmet";
 import { env, corsOrigins } from "./config/env.js";
 import { checkoutRoutes } from "./routes/checkout.js";
 import { webhookRoutes } from "./routes/webhooks.js";
+import { adminRoutes } from "./routes/admin.js";
 import { sweepExpiredReservations } from "./services/expirySweep.js";
 
 const app = Fastify({ logger: true });
@@ -47,6 +48,7 @@ app.get("/health", async () => ({ status: "ok" }));
 
 await app.register(checkoutRoutes);
 await app.register(webhookRoutes);
+await app.register(adminRoutes);
 
 app.post(
   "/internal/sweep-expired",
