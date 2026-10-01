@@ -15,13 +15,30 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(401).send({ error: "Authentication required" });
   }
 
-  const { data, error } = await createServiceClient().auth.getUser(accessToken);
+  const supabase = createServiceClient();
+  const { data, error } = await supabase.auth.getUser(accessToken);
   if (error || !data.user) {
     return reply.status(401).send({ error: "Invalid session" });
   }
-  // app_metadata, not user_metadata: app_metadata is server-controlled and
-  // cannot be set by the signed-in user, so it is safe to authorise on.
-  if (data.user.app_metadata?.role !== "admin") {
+
+  let isAdmin = false;
+  try {
+    const result = await supabase.rpc("is_admin", { uid: data.user.id });
+    if (!result.error && typeof result.data === "boolean") {
+      isAdmin = result.data;
+    } else {
+      const { data: profile, error: profileError } = await supabase
+        .from("profiles")
+        .select("role")
+        .eq("id", data.user.id)
+        .maybeSingle();
+      isAdmin = !profileError && profile?.role === "admin";
+    }
+  } catch {
+    return reply.status(403).send({ error: "Admin access required" });
+  }
+
+  if (!isAdmin) {
     return reply.status(403).send({ error: "Admin access required" });
   }
 }
@@ -89,6 +106,21 @@ export async function adminRoutes(app: FastifyInstance) {
       // stale number that looks authoritative.
       .select("sku,product_id,size,color,available_qty,reserved_qty,updated_at")
       .order("sku", { ascending: true });
+    if (error) throw error;
+    return reply.send({ data: data ?? [] });
+  });
+
+  app.get("/admin/products", async (_request, reply) => {
+    // Order line items carry their own `sku`, and that value matches
+    // products.sku_prefix, not stock_levels.sku (a different numbering, e.g.
+    // stock_levels "NB-1008-MEHROON-XXL" vs products "NTB-BO-420-OBS-0595").
+    // stock_levels.product_id is null on every row, so the prefix is the only
+    // join that resolves. Images live only here.
+    const { data, error } = await createServiceClient()
+      .schema("inventory")
+      .from("products")
+      .select("sku_prefix,name,color,category,image,images,status")
+      .order("name", { ascending: true });
     if (error) throw error;
     return reply.send({ data: data ?? [] });
   });

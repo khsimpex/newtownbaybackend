@@ -5,13 +5,14 @@ WORKDIR /app
 
 # Install dependencies first (cached layer)
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
-# Copy application source
-COPY . .
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
 
+ENV NODE_ENV=production
 ENV PORT=8000
 EXPOSE 8000
 
-# Start development server
-CMD ["npm", "run", "dev"]
+CMD ["npm", "start"]

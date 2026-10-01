@@ -32,6 +32,10 @@ newtownbay-backend-ts/
 | Method | Path | Auth | Rate limit |
 |---|---|---|---|
 | GET | `/health` | none | global 60/min |
+| GET | `/admin/overview` | Supabase bearer session + admin role | global 60/min |
+| GET | `/admin/orders` | Supabase bearer session + admin role | global 60/min |
+| GET | `/admin/inventory` | Supabase bearer session + admin role | global 60/min |
+| GET | `/admin/products` | Supabase bearer session + admin role | global 60/min |
 | POST | `/checkout/reserve` | none | 10/min |
 | POST | `/checkout/verify` | Razorpay signature | global |
 | POST | `/checkout/release` | `reservationSecret` | global |
@@ -147,6 +151,10 @@ compile without type safety.
 ## Config
 
 All required unless noted. Validated at boot — missing vars exit the process.
+
+Admin access uses the same `is_admin(uid)` RPC and `profiles.role` fallback as
+the Next.js admin app. The mobile app sends its Supabase access token as a
+Bearer token.
 
 ```
 SUPABASE_URL                    SUPABASE_SERVICE_ROLE_KEY

@@ -11,9 +11,18 @@
  */
 export interface Database {
   public: {
-    Tables: Record<string, never>;
+    Tables: {
+      profiles: {
+        Row: { id: string; role: "admin" | "customer" };
+        Insert: { id: string; role?: "admin" | "customer" };
+        Update: { id?: string; role?: "admin" | "customer" };
+        Relationships: [];
+      };
+    };
     Views: Record<string, never>;
-    Functions: Record<string, never>;
+    Functions: {
+      is_admin: { Args: { uid?: string }; Returns: boolean };
+    };
     Enums: Record<string, never>;
   };
   inventory: {
@@ -31,6 +40,26 @@ export interface Database {
         };
         Insert: Partial<Database["inventory"]["Tables"]["stock_levels"]["Row"]>;
         Update: Partial<Database["inventory"]["Tables"]["stock_levels"]["Row"]>;
+      };
+      products: {
+        Row: {
+          id: string;
+          /** Matches the `sku` on an order line item. */
+          sku_prefix: string;
+          name: string;
+          category: string | null;
+          gsm: string | null;
+          fabric: string | null;
+          color: string | null;
+          status: string | null;
+          drop: string | null;
+          image: string | null;
+          images: string[] | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<Database["inventory"]["Tables"]["products"]["Row"]>;
+        Update: Partial<Database["inventory"]["Tables"]["products"]["Row"]>;
       };
     };
     Views: Record<string, never>;
