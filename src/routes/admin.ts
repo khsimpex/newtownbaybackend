@@ -124,4 +124,114 @@ export async function adminRoutes(app: FastifyInstance) {
     if (error) throw error;
     return reply.send({ data: data ?? [] });
   });
+
+  app.get("/admin/customers", async (request, reply) => {
+    const querySchema = z.object({
+      q: z.string().trim().max(100).optional(),
+      page: z.coerce.number().int().positive().default(1),
+      pageSize: z.coerce.number().int().min(1).max(100).default(50),
+    });
+    const parsed = querySchema.safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid query" });
+    const { q, page, pageSize } = parsed.data;
+    const supabase: any = createServiceClient();
+    let query = supabase.schema("orders").from("admin_customer_index")
+      .select("customer_key,customer_name,customer_email,customer_phone,order_count,latest_order_id,latest_status,latest_order_at", { count: "exact" })
+      .order("latest_order_at", { ascending: false });
+    if (q) {
+      const safe = q.replace(/[%_]/g, "");
+      query = q.includes("@")
+        ? query.ilike("customer_email", `%${safe}%`)
+        : /^\+?[\d\s-]+$/.test(q)
+          ? query.ilike("customer_phone", `%${safe.replace(/\D/g, "").slice(-10)}%`)
+          : query.ilike("customer_name", `%${safe}%`);
+    }
+    const { data, count, error } = await query.range((page - 1) * pageSize, page * pageSize - 1);
+    if (error) throw error;
+    return reply.send({ data: data ?? [], total: count ?? 0, page, pageSize });
+  });
+
+  app.get<{ Params: { key: string } }>("/admin/customers/:key/orders", async (request, reply) => {
+    const key = decodeURIComponent(request.params.key).trim();
+    const supabase: any = createServiceClient();
+    let query = supabase.schema("orders").from("checkout_reservations")
+      .select("id,reservation_id,customer_name,customer_email,customer_phone,items,status,expires_at,created_at")
+      .order("created_at", { ascending: false }).limit(100);
+    if (key.includes("@")) query = query.ilike("customer_email", key);
+    else if (/^\d{8,15}$/.test(key)) query = query.ilike("customer_phone", `%${key.slice(-10)}`);
+    else query = query.eq("id", key);
+    const { data, error } = await query;
+    if (error) throw error;
+    return reply.send({ data: data ?? [] });
+  });
+
+  app.get("/admin/notifications", async (request, reply) => {
+    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
+    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
+    const { data, error } = await supabase.from("notifications").select("id,type,title,body,entity_id,read_at,created_at")
+      .eq("recipient_user_id", auth.user.id).order("created_at", { ascending: false }).limit(50);
+    if (error) throw error;
+    return reply.send({ data: data ?? [] });
+  });
+
+  app.post<{ Params: { id: string } }>("/admin/notifications/:id/read", async (request, reply) => {
+    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
+    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
+    const { error } = await supabase.from("notifications").update({ read_at: new Date().toISOString() })
+      .eq("id", request.params.id).eq("recipient_user_id", auth.user.id);
+    if (error) throw error;
+    return reply.send({ success: true });
+  });
+
+  app.get("/admin/conversations", async (_request, reply) => {
+    const supabase: any = createServiceClient();
+    const { data, error } = await supabase.schema("orders").from("support_conversations")
+      .select("id,customer_user_id,customer_name,customer_email,status,admin_unread_count,customer_unread_count,created_at,updated_at")
+      .neq("status", "closed").order("updated_at", { ascending: false }).limit(100);
+    if (error) throw error;
+    return reply.send({ data: data ?? [] });
+  });
+
+  app.get<{ Params: { id: string } }>("/admin/conversations/:id/messages", async (request, reply) => {
+    const supabase: any = createServiceClient();
+    const { data: conversation } = await supabase.schema("orders").from("support_conversations")
+      .select("id").eq("id", request.params.id).maybeSingle();
+    if (!conversation) return reply.status(404).send({ error: "Conversation not found" });
+    const { data, error } = await supabase.schema("orders").from("support_messages")
+      .select("id,sender_role,body,created_at").eq("conversation_id", conversation.id)
+      .order("created_at", { ascending: true }).limit(200);
+    if (error) throw error;
+    await supabase.schema("orders").from("support_conversations")
+      .update({ admin_unread_count: 0 }).eq("id", conversation.id);
+    return reply.send({ data: data ?? [] });
+  });
+
+  app.post<{ Params: { id: string } }>("/admin/conversations/:id/reply", async (request, reply) => {
+    const parsed = z.object({ message: z.string().trim().min(1).max(4000) }).safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid message" });
+    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
+    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
+    const { data: conversation } = await supabase.schema("orders").from("support_conversations")
+      .select("id,customer_user_id,customer_unread_count").eq("id", request.params.id).maybeSingle();
+    if (!conversation) return reply.status(404).send({ error: "Conversation not found" });
+    const inserted = await supabase.schema("orders").from("support_messages").insert({
+      conversation_id: conversation.id, sender_user_id: auth.user.id, sender_role: "admin", body: parsed.data.message,
+    }).select("id,sender_role,body,created_at").single();
+    if (inserted.error) throw inserted.error;
+    await supabase.schema("orders").from("support_conversations").update({
+      status: "open", customer_unread_count: (conversation.customer_unread_count ?? 0) + 1, updated_at: new Date().toISOString(),
+    }).eq("id", conversation.id);
+    await supabase.from("notifications").insert({
+      recipient_user_id: conversation.customer_user_id, type: "chat", title: "New reply from Newtownbay",
+      body: parsed.data.message.slice(0, 180), entity_id: conversation.id,
+      dedupe_key: `reply:${inserted.data.id}:${conversation.customer_user_id}`,
+    });
+    return reply.send({ data: inserted.data });
+  });
 }
