@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { createServiceClient } from "../db/supabaseClient.js";
+import { registerAdminPushToken, revokeAdminPushToken } from "../services/pushNotifications.js";
 
 const orderQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
@@ -45,6 +46,28 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
 
 export async function adminRoutes(app: FastifyInstance) {
   app.addHook("preHandler", requireAdmin);
+
+  app.post("/admin/push-token", async (request, reply) => {
+    const parsed = z.object({ token: z.string().min(20).max(4096) }).safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid device token" });
+    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
+    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
+    await registerAdminPushToken(supabase, data.user.id, parsed.data.token);
+    return reply.send({ success: true });
+  });
+
+  app.post("/admin/push-token/revoke", async (request, reply) => {
+    const parsed = z.object({ token: z.string().min(20).max(4096) }).safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid device token" });
+    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
+    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
+    await revokeAdminPushToken(supabase, data.user.id, parsed.data.token);
+    return reply.send({ success: true });
+  });
 
   app.get("/admin/overview", async (_request, reply) => {
     const supabase = createServiceClient();
@@ -199,15 +222,50 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>("/admin/conversations/:id/messages", async (request, reply) => {
     const supabase: any = createServiceClient();
     const { data: conversation } = await supabase.schema("orders").from("support_conversations")
-      .select("id").eq("id", request.params.id).maybeSingle();
+      .select("id,customer_email,customer_unread_count").eq("id", request.params.id).maybeSingle();
     if (!conversation) return reply.status(404).send({ error: "Conversation not found" });
-    const { data, error } = await supabase.schema("orders").from("support_messages")
-      .select("id,sender_role,body,created_at").eq("conversation_id", conversation.id)
-      .order("created_at", { ascending: true }).limit(200);
-    if (error) throw error;
+    const [messagesResult, ordersResult] = await Promise.all([
+      supabase.schema("orders").from("support_messages")
+        .select("id,sender_role,body,created_at").eq("conversation_id", conversation.id)
+        .order("created_at", { ascending: true }).limit(200),
+      conversation.customer_email
+        ? supabase.schema("orders").from("checkout_reservations")
+            .select("reservation_id,razorpay_order_id,status,items,checkout_metadata,created_at")
+            .eq("customer_email", conversation.customer_email)
+            .order("created_at", { ascending: false }).limit(5)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+    if (messagesResult.error) throw messagesResult.error;
+    if (ordersResult.error) throw ordersResult.error;
     await supabase.schema("orders").from("support_conversations")
       .update({ admin_unread_count: 0 }).eq("id", conversation.id);
-    return reply.send({ data: data ?? [] });
+    return reply.send({
+      data: messagesResult.data ?? [],
+      customer_unread_count: conversation.customer_unread_count ?? 0,
+      recent_orders: (ordersResult.data ?? []).map((order: any) => {
+        const metadata = order.checkout_metadata ?? {};
+        const items = order.items;
+        const lines = Array.isArray(items?.items)
+          ? items.items
+          : Array.isArray(items) ? items : [];
+        const returnRequest = metadata.returnRequest ?? metadata.return_request ?? null;
+        return {
+          order_id: order.razorpay_order_id || order.reservation_id,
+          status: order.status,
+          fulfillment_status: metadata.fulfillmentStatus ?? items?.fulfillmentStatus ?? null,
+          created_at: order.created_at,
+          item_summary: lines.slice(0, 4).map((line: any) =>
+            `${line.name || line.sku || "Item"} ×${line.qty || 1}${line.size ? ` · ${line.size}` : ""}`
+          ).join("  /  "),
+          return_request: returnRequest ? {
+            id: returnRequest.id ?? null,
+            status: returnRequest.status ?? "Under review",
+            amount: returnRequest.refundAmount ?? returnRequest.returnTotal ?? null,
+            note: returnRequest.statusText ?? null,
+          } : null,
+        };
+      }),
+    });
   });
 
   app.post<{ Params: { id: string } }>("/admin/conversations/:id/reply", async (request, reply) => {

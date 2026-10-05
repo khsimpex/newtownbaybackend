@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { createServiceClient } from "../db/supabaseClient.js";
+import { sendAdminPush } from "../services/pushNotifications.js";
 
 const messageSchema = z.object({
   conversationId: z.string().uuid().optional(),
@@ -154,16 +155,23 @@ async function notifyAdmins(
 ) {
   const { data: admins } = await supabase.from("profiles").select("id").eq("role", "admin");
   if (!admins?.length) return;
-  await supabase.from("notifications").insert(
-    admins.map((admin: { id: string }) => ({
-      recipient_user_id: admin.id,
-      type: "chat",
-      title: "New customer message",
-      body: customerName + ": new message in support chat",
-      entity_id: conversationId,
-      dedupe_key: "chat:" + messageId + ":" + admin.id,
-    }))
-  );
+  const notifications = admins.map((admin: { id: string }) => ({
+    recipient_user_id: admin.id,
+    type: "chat",
+    title: "New customer message",
+    body: customerName + ": new message in support chat",
+    entity_id: conversationId,
+    dedupe_key: "chat:" + messageId + ":" + admin.id,
+  }));
+  const { data, error } = await supabase.from("notifications").insert(
+    notifications
+  ).select("recipient_user_id,title,body,entity_id");
+  if (error) throw error;
+  await Promise.all((data ?? []).map((item: any) => sendAdminPush(
+    supabase,
+    item.recipient_user_id,
+    { title: item.title, body: item.body, entityId: item.entity_id }
+  )));
 }
 
 export async function supportRoutes(app: FastifyInstance) {

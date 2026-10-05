@@ -17,6 +17,7 @@ const envSchema = z.object({
   // Shared secret required in the X-Internal-Secret header to call
   // /internal/sweep-expired. Generate with: openssl rand -hex 32
   INTERNAL_SWEEP_SECRET: z.string().min(16),
+  FIREBASE_SERVICE_ACCOUNT_JSON: z.string().min(1).optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);
