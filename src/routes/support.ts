@@ -27,12 +27,21 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
   const text = message.toLowerCase().trim();
 
   // 1. Greetings & Welcome
-  if (/^(hi|hello|hey|help|start|good\s*(morning|afternoon|evening))\b/i.test(text)) {
-    return "Hello! Welcome to Newtownbay Atelier Concierge. 🖤\n\nI can assist you with:\n• 📦 Order tracking and status\n• 💸 Return and refund requests\n• 📏 Sizing and fit guidance\n• 🧵 Fabric composition and live stock\n\nYou can also say \"talk to human\" anytime to speak directly with our team.";
+  if (/^(hi|hello|hey|help|start|hola|greetings|good\s*(morning|afternoon|evening))\b/i.test(text)) {
+    return (
+      "Hello! Welcome to Newtownbay Atelier Concierge. 🖤\n\n" +
+      "I am your automated concierge and can help you with:\n" +
+      "• 📦 Live order tracking and delivery status\n" +
+      "• 🔄 7-day doorstep size swaps, returns & refunds\n" +
+      "• 📏 Sizing recommendations for our boxy oversized silhouettes\n" +
+      "• 🧵 Heavyweight fabric specs (pure combed cotton)\n" +
+      "• 🚚 Express pan-India shipping & dispatch timelines\n\n" +
+      "What can I help you with today?"
+    );
   }
 
-  // 2. Refund & Return Status
-  if (/\b(refund|return|exchange|swap)\b/i.test(text)) {
+  // 2. Refund & Return Status & Exchanges
+  if (/\b(refund|return|exchange|swap|replace|money\s*back|store\s*credit)\b/i.test(text)) {
     try {
       const emailFilter = user.email ? "customer_email.eq." + user.email : "id.is.null";
       const phoneFilter = user.phone ? ",customer_phone.eq." + user.phone : "";
@@ -58,16 +67,28 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
         const statusText = ret.statusText || "Return request received and being processed.";
         const txnId = ret.refundTransactionId ? "\n• Transaction: " + ret.refundTransactionId : "";
 
-        return "Return / Refund Details for Order " + (orderWithReturn.razorpay_order_id || orderWithReturn.reservation_id) + ":\n• Return ID: " + returnId + "\n• Status: " + status + "\n• Amount: ₹" + refundAmt + txnId + "\n• Note: " + statusText + "\n\nLet me know if you would like to speak to an agent for further assistance.";
+        return (
+          "Return / Refund Details for Order " + (orderWithReturn.razorpay_order_id || orderWithReturn.reservation_id) + ":\n" +
+          "• Return ID: " + returnId + "\n" +
+          "• Status: " + status + "\n" +
+          "• Amount: ₹" + refundAmt + txnId + "\n" +
+          "• Note: " + statusText + "\n\n" +
+          "Let me know if you need any additional info, or tap 'Chat to Customer Care' if you would like manual assistance."
+        );
       }
     } catch (e) {
       console.error("[Bot] Return status check error:", e);
     }
-    return "Eligible orders can request a doorstep size exchange or return within 7 days of delivery directly from your account (/dashboard/orders). If you already filed a request or need manual review, ask for a human agent.";
+    return (
+      "Eligible orders can request a 7-day doorstep size exchange or return directly from your account (/dashboard/orders).\n\n" +
+      "• Size Swaps: Our courier partner brings your calibrated replacement size and retrieves the initial piece in one doorstep interaction.\n" +
+      "• Return to Credit: Garments can also be converted to non-expiring store credit.\n\n" +
+      "Visit /dashboard/orders to initiate, or let me know if you have other questions!"
+    );
   }
 
   // 3. Order Tracking & Details
-  if (/\b(order|track|tracking|status|dispatch|delivery|where is my order|shipment)\b/i.test(text) || /\b(ntb-[a-z0-9-]+|order_[a-z0-9]+)\b/i.test(text)) {
+  if (/\b(order|track|tracking|status|dispatch|delivery|where is my order|shipment|parcel|awb)\b/i.test(text) || /\b(ntb-[a-z0-9-]+|order_[a-z0-9]+)\b/i.test(text)) {
     try {
       const idMatch = text.match(/\b(order_[a-z0-9]+|ntb-[a-z0-9-]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
       let query = supabase
@@ -99,26 +120,51 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
           itemList = "\n• Items: " + rawItems.map((i: any) => (i.name || i.sku) + " (" + (i.size || "STD") + " x" + (i.qty || 1) + ")").slice(0, 3).join(", ");
         }
 
-        return "Here is your most recent order:\n• Order ID: " + (o.razorpay_order_id || o.reservation_id) + "\n• Status: " + fulfillment + courier + trackingNum + itemList + "\n\nYou can track full updates anytime on your Orders page. Ask for a human agent if you need changes!";
+        return (
+          "Here is your latest order status:\n" +
+          "• Order ID: " + (o.razorpay_order_id || o.reservation_id) + "\n" +
+          "• Status: " + fulfillment + courier + trackingNum + itemList + "\n\n" +
+          "You can view live tracking and download invoices from your Orders page (/dashboard/orders)."
+        );
       }
     } catch (e) {
       console.error("[Bot] Order lookup error:", e);
     }
-    return "I couldn't find an order matching that request. Please provide your Order ID (e.g. NTB-... or order_...) or ask for a human agent to check our fulfillment database.";
+    return "I couldn't find an order on file matching that request. Please provide your Order ID (e.g. NTB-... or order_...) or check your Orders dashboard (/dashboard/orders).";
   }
 
-  // 4. Sizing & Fit
-  if (/\b(size|fit|sizing|measurement|chart)\b/i.test(text)) {
-    return "Our garments feature a heavyweight, architectural boxy oversized fit (320–450 GSM pure combed cotton). We recommend choosing your true size for a relaxed drop-shoulder silhouette, or sizing down one size for a more fitted look. Full garment measurements are on every product page.";
+  // 4. Sizing & Fit Guide
+  if (/\b(size|fit|sizing|measurement|chart|oversized|boxy|chest)\b/i.test(text)) {
+    return (
+      "Our garments feature an architectural boxy oversized fit engineered from heavyweight pure combed cotton.\n\n" +
+      "• True-to-Size: Delivers our intended drop-shoulder relaxed silhouette.\n" +
+      "• Fitted Look: If you prefer a tailored chest drape, we recommend sizing down one size.\n" +
+      "• Measurements: Exact flat-lay centimeters for chest, length, and shoulder are listed on every product page.\n\n" +
+      "Every drop is also covered by our 7-Day Doorstep Size Swap guarantee!"
+    );
   }
 
   // 5. Shipping Policy & Times
-  if (/\b(ship|shipping|courier|dispatch|free shipping|fee)\b/i.test(text)) {
-    return "Orders ₹999 and above enjoy Free Express Dispatch across India. Orders below ₹999 incur a ₹150 express dispatch fee. In-stock orders placed before 3 PM IST (Monday–Saturday) dispatch the same day.";
+  if (/\b(ship|shipping|courier|dispatch|free shipping|fee|how long|time|delivery)\b/i.test(text)) {
+    return (
+      "Shipping & Dispatch SLA:\n" +
+      "• Free Shipping: Orders ₹999 and above receive Free Express Dispatch across India.\n" +
+      "• Standard Dispatch Fee: Orders below ₹999 incur a flat ₹150 express dispatch fee.\n" +
+      "• Same-Day Dispatch: In-stock orders placed before 3:00 PM IST (Mon–Sat) are packed and dispatched the same day.\n" +
+      "• Delivery Window: Metro hubs take 24–48 hours; other locations take 3–5 business days via Blue Dart / Delhivery."
+    );
   }
 
-  // 6. Product Specs & Live Stock
-  if (/\b(product|fabric|cotton|gsm|stock|available|price|sku)\b/i.test(text)) {
+  // 6. Fabric, GSM, Quality & Care
+  if (/\b(product|fabric|cotton|gsm|stock|available|price|sku|material|quality|wash|care)\b/i.test(text)) {
+    if (/\b(wash|care|dry|clean|iron)\b/i.test(text)) {
+      return (
+        "Garment Care for Heavyweight Cotton:\n" +
+        "• Wash: Cold machine wash (30°C max) inside out on gentle cycle.\n" +
+        "• Dry: Flat dry in shade. Avoid tumble drying to preserve fabric loft.\n" +
+        "• Iron: Warm iron inside out; never iron directly on screen prints or embroidery."
+      );
+    }
     try {
       const { data: products } = await supabase.schema("inventory").from("products")
         .select("id,sku_prefix,name,color,category,fabric,gsm,status")
@@ -137,11 +183,22 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
       }
       const names = (products ?? []).slice(0, 6).map((p: any) => p.name).filter(Boolean);
       return names.length
-        ? "Featured pieces: " + names.join(", ") + ". Send a piece name or SKU for live sizing and stock."
-        : "I cannot confirm catalog details right now. Ask for a human agent and our concierge team will help.";
+        ? "Featured pieces: " + names.join(", ") + ". Send any piece name or SKU for live sizing and stock availability."
+        : "Our pieces are engineered from pure combed compact cotton with reinforced ribbed zero-sag collars.";
     } catch (e) {
       console.error("[Bot] Product lookup error:", e);
     }
+    return "All Newtownbay pieces are crafted from heavyweight 100% combed compact cotton with double-needle construction and zero-sag collars.";
+  }
+
+  // 7. Coupons & Promotions
+  if (/\b(coupon|promo|discount|code|voucher|offer)\b/i.test(text)) {
+    return (
+      "Promotions & Discounts:\n" +
+      "• All orders ₹999 and above automatically qualify for Free Express Pan-India Shipping.\n" +
+      "• Seasonal drop discount codes can be applied directly at checkout in the promo code field.\n" +
+      "• If an order does not dispatch within our 48-hour SLA, you receive a ₹200 store credit voucher."
+    );
   }
 
   return null;
@@ -159,7 +216,7 @@ async function notifyAdmins(
     recipient_user_id: admin.id,
     type: "chat",
     title: "New customer message",
-    body: customerName + ": new message in support chat",
+    body: customerName + ": requested customer care in support chat",
     entity_id: conversationId,
     dedupe_key: "chat:" + messageId + ":" + admin.id,
   }));
@@ -262,7 +319,7 @@ export async function supportRoutes(app: FastifyInstance) {
     if (inserted.error) throw inserted.error;
 
     const isAlreadyOpen = conversation.status === "open";
-    const asksForPerson = /\b(agent|human|person|representative|concierge|admin)\b/i.test(parsed.data.message);
+    const asksForPerson = /\b(agent|human|person|representative|concierge|admin|customer\s*care|care|support\s*team|talk\s*to\s*(someone|person|human|agent))\b/i.test(parsed.data.message);
 
     // CASE 1: Conversation is ALREADY handed off to human/admin
     if (isAlreadyOpen) {
@@ -272,27 +329,11 @@ export async function supportRoutes(app: FastifyInstance) {
       }).eq("id", conversation.id);
 
       await notifyAdmins(supabase, conversation.id, customerName, inserted.data.id);
-      // DO NOT repeat the handoff message! The admin already knows.
-      return reply.send({ conversationId: conversation.id, data: [inserted.data] });
+      return reply.send({ conversationId: conversation.id, status: "open", data: [inserted.data] });
     }
 
-    // CASE 2: Conversation is in BOT mode
-    const answer = !asksForPerson ? await faqAnswer(supabase, parsed.data.message, user) : null;
-
-    if (answer) {
-      // Bot has an answer! Update conversation timestamp and save bot response
-      await supabase.schema("orders").from("support_conversations").update({
-        updated_at: new Date().toISOString(),
-      }).eq("id", conversation.id);
-
-      const bot = await supabase.schema("orders").from("support_messages").insert({
-        conversation_id: conversation.id, sender_role: "bot", body: answer,
-      }).select("id,sender_role,body,created_at").single();
-      if (bot.error) throw bot.error;
-
-      return reply.send({ conversationId: conversation.id, data: [inserted.data, bot.data] });
-    } else {
-      // Handoff to human for the FIRST time
+    // CASE 2: Customer specifically requests human Customer Care
+    if (asksForPerson) {
       await supabase.schema("orders").from("support_conversations").update({
         status: "open",
         admin_unread_count: (conversation.admin_unread_count ?? 0) + 1,
@@ -301,9 +342,7 @@ export async function supportRoutes(app: FastifyInstance) {
 
       await notifyAdmins(supabase, conversation.id, customerName, inserted.data.id);
 
-      const handoffText = asksForPerson
-        ? "I have connected you with our human concierge team. An admin will reply here shortly."
-        : "I have forwarded your question to our concierge team. An admin will reply here shortly.";
+      const handoffText = "I have connected you with our human customer care team. A concierge specialist will reply to your message shortly.";
 
       const handoff = await supabase.schema("orders").from("support_messages").insert({
         conversation_id: conversation.id,
@@ -312,7 +351,33 @@ export async function supportRoutes(app: FastifyInstance) {
       }).select("id,sender_role,body,created_at").single();
       if (handoff.error) throw handoff.error;
 
-      return reply.send({ conversationId: conversation.id, data: [inserted.data, handoff.data] });
+      return reply.send({ conversationId: conversation.id, status: "open", data: [inserted.data, handoff.data] });
     }
+
+    // CASE 3: Standard Bot Mode - provide answer or guidance without prematurely escalating to human
+    const answer = await faqAnswer(supabase, parsed.data.message, user);
+
+    const botReplyText = answer || (
+      "I'm the Newtownbay AI Concierge 🤖. I specialize in:\n" +
+      "• 📦 Live order tracking and delivery status\n" +
+      "• 🔄 Doorstep size swaps (7-day window) & return policy\n" +
+      "• 📏 Sizing recommendations for our oversized boxy fit\n" +
+      "• 🧵 Heavyweight fabric specs (pure combed cotton)\n" +
+      "• 🚚 Express pan-India shipping & courier details\n\n" +
+      "Please let me know if you would like information on any of these topics, or select 'Chat to Customer Care' if you need personalized assistance from our team."
+    );
+
+    await supabase.schema("orders").from("support_conversations").update({
+      updated_at: new Date().toISOString(),
+    }).eq("id", conversation.id);
+
+    const bot = await supabase.schema("orders").from("support_messages").insert({
+      conversation_id: conversation.id,
+      sender_role: "bot",
+      body: botReplyText,
+    }).select("id,sender_role,body,created_at").single();
+    if (bot.error) throw bot.error;
+
+    return reply.send({ conversationId: conversation.id, status: "bot", data: [inserted.data, bot.data] });
   });
 }
