@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { createServiceClient } from "../db/supabaseClient.js";
-import { registerAdminPushToken, revokeAdminPushToken } from "../services/pushNotifications.js";
+import { registerAdminPushToken, revokeAdminPushToken, sendAdminPushDetailed } from "../services/pushNotifications.js";
 
 const orderQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
@@ -67,6 +67,19 @@ export async function adminRoutes(app: FastifyInstance) {
     if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
     await revokeAdminPushToken(supabase, data.user.id, parsed.data.token);
     return reply.send({ success: true });
+  });
+
+  app.post("/admin/push-test", async (request, reply) => {
+    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const supabase: any = createServiceClient();
+    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
+    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
+    const result = await sendAdminPushDetailed(supabase, data.user.id, {
+      title: "Newtownbay Ops test",
+      body: "This is a test push notification.",
+      entityId: "push-test",
+    });
+    return reply.code(result.status === "accepted_by_fcm" ? 200 : 503).send(result);
   });
 
   app.get("/admin/overview", async (_request, reply) => {
