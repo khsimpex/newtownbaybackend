@@ -1,8 +1,9 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { env } from "../config/env.js";
 import { createServiceClient } from "../db/supabaseClient.js";
 import { registerAdminPushToken, revokeAdminPushToken, sendAdminPushDetailed } from "../services/pushNotifications.js";
+import { requireAdmin, adminOf } from "../lib/adminAuth.js";
+import { escapeLike, UUID_RE } from "../lib/security.js";
 
 const orderQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
@@ -10,71 +11,31 @@ const orderQuerySchema = z.object({
   status: z.enum(["pending", "processing", "committed", "released", "expired"]).optional(),
 });
 
-async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
-  const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-  if (!accessToken) {
-    return reply.status(401).send({ error: "Authentication required" });
-  }
-
-  const supabase = createServiceClient();
-  const { data, error } = await supabase.auth.getUser(accessToken);
-  if (error || !data.user) {
-    return reply.status(401).send({ error: "Invalid session" });
-  }
-
-  let isAdmin = false;
-  try {
-    const result = await supabase.rpc("is_admin", { uid: data.user.id });
-    if (!result.error && typeof result.data === "boolean") {
-      isAdmin = result.data;
-    } else {
-      const { data: profile, error: profileError } = await supabase
-        .from("profiles")
-        .select("role")
-        .eq("id", data.user.id)
-        .maybeSingle();
-      isAdmin = !profileError && profile?.role === "admin";
-    }
-  } catch {
-    return reply.status(403).send({ error: "Admin access required" });
-  }
-
-  if (!isAdmin) {
-    return reply.status(403).send({ error: "Admin access required" });
-  }
-}
-
 export async function adminRoutes(app: FastifyInstance) {
   app.addHook("preHandler", requireAdmin);
 
   app.post("/admin/push-token", async (request, reply) => {
     const parsed = z.object({ token: z.string().min(20).max(4096) }).safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: "Invalid device token" });
-    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
-    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
-    await registerAdminPushToken(supabase, data.user.id, parsed.data.token);
+    await registerAdminPushToken(supabase, admin.id, parsed.data.token);
     return reply.send({ success: true });
   });
 
   app.post("/admin/push-token/revoke", async (request, reply) => {
     const parsed = z.object({ token: z.string().min(20).max(4096) }).safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: "Invalid device token" });
-    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
-    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
-    await revokeAdminPushToken(supabase, data.user.id, parsed.data.token);
+    await revokeAdminPushToken(supabase, admin.id, parsed.data.token);
     return reply.send({ success: true });
   });
 
   app.post("/admin/push-test", async (request, reply) => {
-    const accessToken = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data } = accessToken ? await supabase.auth.getUser(accessToken) : { data: null };
-    if (!data?.user) return reply.status(401).send({ error: "Invalid session" });
-    const result = await sendAdminPushDetailed(supabase, data.user.id, {
+    const result = await sendAdminPushDetailed(supabase, admin.id, {
       title: "Newtownbay Ops test",
       body: "This is a test push notification.",
       entityId: "push-test",
@@ -175,12 +136,10 @@ export async function adminRoutes(app: FastifyInstance) {
       .select("customer_key,customer_name,customer_email,customer_phone,order_count,latest_order_id,latest_status,latest_order_at", { count: "exact" })
       .order("latest_order_at", { ascending: false });
     if (q) {
-      const safe = q.replace(/[%_]/g, "");
-      query = q.includes("@")
-        ? query.ilike("customer_email", `%${safe}%`)
-        : /^\+?[\d\s-]+$/.test(q)
-          ? query.ilike("customer_phone", `%${safe.replace(/\D/g, "").slice(-10)}%`)
-          : query.ilike("customer_name", `%${safe}%`);
+      // escapeLike (not stripping) so emails/names containing "_" still match literally.
+      if (q.includes("@")) query = query.ilike("customer_email", `%${escapeLike(q)}%`);
+      else if (/^\+?[\d\s-]+$/.test(q)) query = query.ilike("customer_phone", `%${q.replace(/\D/g, "").slice(-10)}%`);
+      else query = query.ilike("customer_name", `%${escapeLike(q)}%`);
     }
     const { data, count, error } = await query.range((page - 1) * pageSize, page * pageSize - 1);
     if (error) throw error;
@@ -188,37 +147,39 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   app.get<{ Params: { key: string } }>("/admin/customers/:key/orders", async (request, reply) => {
-    const key = decodeURIComponent(request.params.key).trim();
+    // Fastify has already URL-decoded params. Decoding again double-decodes and
+    // throws URIError (-> 500) on a stray "%".
+    const key = request.params.key.trim();
+    if (!key || key.length > 254) return reply.status(400).send({ error: "Invalid customer key" });
+
     const supabase: any = createServiceClient();
     let query = supabase.schema("orders").from("checkout_reservations")
       .select("id,reservation_id,customer_name,customer_email,customer_phone,items,status,expires_at,created_at")
       .order("created_at", { ascending: false }).limit(100);
-    if (key.includes("@")) query = query.ilike("customer_email", key);
+    if (key.includes("@")) query = query.ilike("customer_email", escapeLike(key));
     else if (/^\d{8,15}$/.test(key)) query = query.ilike("customer_phone", `%${key.slice(-10)}`);
-    else query = query.eq("id", key);
+    else if (UUID_RE.test(key)) query = query.eq("id", key);
+    else return reply.status(400).send({ error: "Invalid customer key" });
+
     const { data, error } = await query;
     if (error) throw error;
     return reply.send({ data: data ?? [] });
   });
 
   app.get("/admin/notifications", async (request, reply) => {
-    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
-    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
     const { data, error } = await supabase.from("notifications").select("id,type,title,body,entity_id,read_at,created_at")
-      .eq("recipient_user_id", auth.user.id).order("created_at", { ascending: false }).limit(50);
+      .eq("recipient_user_id", admin.id).order("created_at", { ascending: false }).limit(50);
     if (error) throw error;
     return reply.send({ data: data ?? [] });
   });
 
   app.post<{ Params: { id: string } }>("/admin/notifications/:id/read", async (request, reply) => {
-    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
-    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
     const { error } = await supabase.from("notifications").update({ read_at: new Date().toISOString() })
-      .eq("id", request.params.id).eq("recipient_user_id", auth.user.id);
+      .eq("id", request.params.id).eq("recipient_user_id", admin.id);
     if (error) throw error;
     return reply.send({ success: true });
   });
@@ -284,15 +245,13 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>("/admin/conversations/:id/reply", async (request, reply) => {
     const parsed = z.object({ message: z.string().trim().min(1).max(4000) }).safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: "Invalid message" });
-    const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const admin = adminOf(request);
     const supabase: any = createServiceClient();
-    const { data: auth } = token ? await supabase.auth.getUser(token) : { data: null };
-    if (!auth?.user) return reply.status(401).send({ error: "Invalid session" });
     const { data: conversation } = await supabase.schema("orders").from("support_conversations")
       .select("id,customer_user_id,customer_unread_count").eq("id", request.params.id).maybeSingle();
     if (!conversation) return reply.status(404).send({ error: "Conversation not found" });
     const inserted = await supabase.schema("orders").from("support_messages").insert({
-      conversation_id: conversation.id, sender_user_id: auth.user.id, sender_role: "admin", body: parsed.data.message,
+      conversation_id: conversation.id, sender_user_id: admin.id, sender_role: "admin", body: parsed.data.message,
     }).select("id,sender_role,body,created_at").single();
     if (inserted.error) throw inserted.error;
     await supabase.schema("orders").from("support_conversations").update({
