@@ -9,11 +9,17 @@ import {
   verifyPayment,
   releaseReservation,
 } from "../services/checkoutService.js";
+import { requireUser } from "../lib/userAuth.js";
 
 export async function checkoutRoutes(app: FastifyInstance) {
   // Tighter than the global 60/min: each call locks real stock and creates a
   // Razorpay order, so a loop here can exhaust inventory.
-  app.post("/checkout/reserve", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request, reply) => {
+  //
+  // Accounts only — no guest checkout. The Next.js proxy at
+  // /api/checkout/reserve resolves the session and forwards its access token;
+  // the browser does not send one. Deploy that proxy BEFORE this gate, or
+  // every checkout 401s.
+  app.post("/checkout/reserve", { preHandler: requireUser, config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request, reply) => {
     const parsed = reserveRequestSchema.safeParse(request.body);
 
     if (!parsed.success) {

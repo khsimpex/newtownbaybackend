@@ -23,6 +23,77 @@ async function signedInUser(request: FastifyRequest, reply: FastifyReply) {
   return data.user;
 }
 
+const ORDER_SELECT = "id, reservation_id, razorpay_order_id, status, items, checkout_metadata, created_at";
+
+/**
+ * True only when the order's recorded buyer is the signed-in caller.
+ *
+ * Checkout is accounts-only and finalize stamps checkout_metadata.userId from
+ * the session, so this id is server-written and cannot be forged by the client.
+ * Deliberately no email or phone fallback: a matching address or number on the
+ * order proves nothing, because anyone can register either.
+ */
+function isOrderOwner(order: any, user: any): boolean {
+  if (!order || !user) return false;
+
+  const orderUserId = order?.checkout_metadata?.userId;
+  return Boolean(orderUserId) && String(orderUserId) === String(user.id);
+}
+
+/**
+ * Orders that belong to the signed-in caller, newest first.
+ *
+ * One jsonb filter on the buyer id written at finalize. Deliberately NOT built
+ * as a PostgREST `or=` string: `or=` treats "," and ")" as syntax, so
+ * interpolating an email like `a,b@x.com` silently widened the filter to other
+ * customers' rows.
+ */
+async function ownOrders(supabase: any, user: any, limit: number): Promise<any[]> {
+  const { data, error } = await supabase
+    .schema("orders")
+    .from("checkout_reservations")
+    .select(ORDER_SELECT)
+    .eq("checkout_metadata->>userId", String(user.id))
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("[Support] ownOrders failed:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+/**
+ * Look an order up by the identifier the caller quoted, then confirm ownership.
+ * Exact match only — a substring match let one caller walk into another
+ * customer's order by quoting a fragment of its id.
+ */
+async function orderByQuotedId(supabase: any, targetId: string, user: any): Promise<any | null> {
+  // The caller's own regex happens to permit only [A-Za-z0-9-] today, but this
+  // helper must not depend on that. PostgREST `or=` treats "," "(" ")" "." and
+  // ":" as syntax, so rebuild the guarantee here instead of inheriting it.
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(targetId)) return null;
+
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId);
+  const filter = [
+    `reservation_id.eq.${targetId}`,
+    `razorpay_order_id.eq.${targetId}`,
+    ...(isUuid ? [`id.eq.${targetId}`] : []),
+  ].join(",");
+
+  const { data } = await supabase
+    .schema("orders")
+    .from("checkout_reservations")
+    .select(ORDER_SELECT)
+    .or(filter)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  const found = (data ?? [])[0] ?? null;
+  return isOrderOwner(found, user) ? found : null;
+}
+
 async function faqAnswer(supabase: any, message: string, user: any): Promise<string | null> {
   const text = message.toLowerCase().trim();
 
@@ -43,15 +114,7 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
   // 2. Refund & Return Status & Exchanges
   if (/\b(refund|return|exchange|swap|replace|money\s*back|store\s*credit)\b/i.test(text)) {
     try {
-      const emailFilter = user.email ? "customer_email.eq." + user.email : "id.is.null";
-      const phoneFilter = user.phone ? ",customer_phone.eq." + user.phone : "";
-      const { data: orders } = await supabase
-        .schema("orders")
-        .from("checkout_reservations")
-        .select("id, reservation_id, razorpay_order_id, status, checkout_metadata, created_at")
-        .or(emailFilter + phoneFilter)
-        .order("created_at", { ascending: false })
-        .limit(5);
+      const orders = await ownOrders(supabase, user, 5);
 
       const orderWithReturn = (orders || []).find((o: any) => {
         const meta = o.checkout_metadata || {};
@@ -91,23 +154,11 @@ async function faqAnswer(supabase: any, message: string, user: any): Promise<str
   if (/\b(order|track|tracking|status|dispatch|delivery|where is my order|shipment|parcel|awb)\b/i.test(text) || /\b(ntb-[a-z0-9-]+|order_[a-z0-9]+)\b/i.test(text)) {
     try {
       const idMatch = text.match(/\b(order_[a-z0-9]+|ntb-[a-z0-9-]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
-      let query = supabase
-        .schema("orders")
-        .from("checkout_reservations")
-        .select("id, reservation_id, razorpay_order_id, status, items, checkout_metadata, created_at");
+      const orders = idMatch
+        ? [await orderByQuotedId(supabase, idMatch[1], user)].filter(Boolean)
+        : await ownOrders(supabase, user, 1);
 
-      if (idMatch) {
-        const targetId = idMatch[1];
-        query = query.or("razorpay_order_id.ilike.%" + targetId + "%,reservation_id.ilike.%" + targetId + "%,id.eq." + targetId);
-      } else {
-        const emailFilter = user.email ? "customer_email.eq." + user.email : "id.is.null";
-        const phoneFilter = user.phone ? ",customer_phone.eq." + user.phone : "";
-        query = query.or(emailFilter + phoneFilter);
-      }
-
-      const { data: orders } = await query.order("created_at", { ascending: false }).limit(1);
-
-      if (orders && orders.length > 0) {
+      if (orders.length > 0) {
         const o = orders[0];
         const meta = o.checkout_metadata || {};
         const fulfillment = meta.fulfillmentStatus || (o.status === "committed" ? "Processing / Dispatched" : String(o.status).toUpperCase());
