@@ -76,6 +76,22 @@ await app.register(webhookRoutes);
 await app.register(adminRoutes);
 await app.register(supportRoutes);
 
+// Make a misconfigured concierge visible at boot rather than in a customer
+// reply: the model path is off unless CONCIERGE_AI_ENABLED=true and a key is
+// set, and that downgrade is otherwise silent.
+app.log.info(
+  {
+    aiEnabled: env.CONCIERGE_AI_ENABLED && Boolean(env.ANTHROPIC_API_KEY),
+    aiFlag: env.CONCIERGE_AI_ENABLED,
+    keyPresent: Boolean(env.ANTHROPIC_API_KEY),
+    model: env.CONCIERGE_MODEL,
+    hourlyLimitPerCustomer: env.CONCIERGE_AI_HOURLY_LIMIT_PER_CUSTOMER,
+    dailyLimit: env.CONCIERGE_AI_DAILY_LIMIT,
+    adminOfflineAfterMinutes: env.ADMIN_OFFLINE_AFTER_MINUTES,
+  },
+  "concierge bot config"
+);
+
 app.post(
   "/internal/sweep-expired",
   // Throttled (not unlimited): an unthrottled secret check can be brute-forced.

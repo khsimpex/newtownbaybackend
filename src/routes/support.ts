@@ -2,11 +2,18 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { createServiceClient } from "../db/supabaseClient.js";
 import { sendAdminPush } from "../services/pushNotifications.js";
+import { isAdminOnline } from "../services/adminPresence.js";
+import { FOLLOW_UP_LINE, MENU_REPLY, aiAnswer, ruleAnswer } from "../services/conciergeBot.js";
+import { SCOPE_REPLY, offTopicReason } from "../services/conciergeScope.js";
 
 const messageSchema = z.object({
   conversationId: z.string().uuid().optional(),
   message: z.string().trim().min(1).max(4000),
 });
+
+/** Sent when a customer asks for a person while admins are around. */
+const ONLINE_HANDOFF =
+  "I have connected you with our human customer care team. A concierge specialist will reply to your message shortly.";
 
 async function signedInUser(request: FastifyRequest, reply: FastifyReply) {
   const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -23,251 +30,30 @@ async function signedInUser(request: FastifyRequest, reply: FastifyReply) {
   return data.user;
 }
 
-const ORDER_SELECT = "id, reservation_id, razorpay_order_id, status, items, checkout_metadata, created_at";
-
 /**
- * True only when the order's recorded buyer is the signed-in caller.
+ * Alert every admin device that a customer is waiting.
  *
- * Checkout is accounts-only and finalize stamps checkout_metadata.userId from
- * the session, so this id is server-written and cannot be forged by the client.
- * Deliberately no email or phone fallback: a matching address or number on the
- * order proves nothing, because anyone can register either.
+ * `needsHelp` is what the admin reads first, so it decides the title: a message
+ * the bot could not answer says so, while one it did answer is a follow-up.
+ * The body carries the customer's own words — an alert reading only "requested
+ * customer care" told the admin nothing they could act on without opening the app.
  */
-function isOrderOwner(order: any, user: any): boolean {
-  if (!order || !user) return false;
-
-  const orderUserId = order?.checkout_metadata?.userId;
-  return Boolean(orderUserId) && String(orderUserId) === String(user.id);
-}
-
-/**
- * Orders that belong to the signed-in caller, newest first.
- *
- * One jsonb filter on the buyer id written at finalize. Deliberately NOT built
- * as a PostgREST `or=` string: `or=` treats "," and ")" as syntax, so
- * interpolating an email like `a,b@x.com` silently widened the filter to other
- * customers' rows.
- */
-async function ownOrders(supabase: any, user: any, limit: number): Promise<any[]> {
-  const { data, error } = await supabase
-    .schema("orders")
-    .from("checkout_reservations")
-    .select(ORDER_SELECT)
-    .eq("checkout_metadata->>userId", String(user.id))
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (error) {
-    console.error("[Support] ownOrders failed:", error.message);
-    return [];
-  }
-  return data ?? [];
-}
-
-/**
- * Look an order up by the identifier the caller quoted, then confirm ownership.
- * Exact match only — a substring match let one caller walk into another
- * customer's order by quoting a fragment of its id.
- */
-async function orderByQuotedId(supabase: any, targetId: string, user: any): Promise<any | null> {
-  // The caller's own regex happens to permit only [A-Za-z0-9-] today, but this
-  // helper must not depend on that. PostgREST `or=` treats "," "(" ")" "." and
-  // ":" as syntax, so rebuild the guarantee here instead of inheriting it.
-  if (!/^[A-Za-z0-9_-]{4,64}$/.test(targetId)) return null;
-
-  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetId);
-  const filter = [
-    `reservation_id.eq.${targetId}`,
-    `razorpay_order_id.eq.${targetId}`,
-    ...(isUuid ? [`id.eq.${targetId}`] : []),
-  ].join(",");
-
-  const { data } = await supabase
-    .schema("orders")
-    .from("checkout_reservations")
-    .select(ORDER_SELECT)
-    .or(filter)
-    .order("created_at", { ascending: false })
-    .limit(1);
-
-  const found = (data ?? [])[0] ?? null;
-  return isOrderOwner(found, user) ? found : null;
-}
-
-async function faqAnswer(supabase: any, message: string, user: any): Promise<string | null> {
-  const text = message.toLowerCase().trim();
-
-  // 1. Greetings & Welcome
-  if (/^(hi|hello|hey|help|start|hola|greetings|good\s*(morning|afternoon|evening))\b/i.test(text)) {
-    return (
-      "Hello! Welcome to Newtownbay Atelier Concierge. 🖤\n\n" +
-      "I am your automated concierge and can help you with:\n" +
-      "• 📦 Live order tracking and delivery status\n" +
-      "• 🔄 7-day doorstep size swaps, returns & refunds\n" +
-      "• 📏 Sizing recommendations for our boxy oversized silhouettes\n" +
-      "• 🧵 Heavyweight fabric specs (pure combed cotton)\n" +
-      "• 🚚 Express pan-India shipping & dispatch timelines\n\n" +
-      "What can I help you with today?"
-    );
-  }
-
-  // 2. Refund & Return Status & Exchanges
-  if (/\b(refund|return|exchange|swap|replace|money\s*back|store\s*credit)\b/i.test(text)) {
-    try {
-      const orders = await ownOrders(supabase, user, 5);
-
-      const orderWithReturn = (orders || []).find((o: any) => {
-        const meta = o.checkout_metadata || {};
-        return meta.returnRequest || meta.return_request;
-      });
-
-      if (orderWithReturn) {
-        const meta = orderWithReturn.checkout_metadata || {};
-        const ret = meta.returnRequest || meta.return_request;
-        const returnId = ret.id || "N/A";
-        const status = ret.status || "UNDER REVIEW";
-        const refundAmt = ret.refundAmount || ret.returnTotal || 0;
-        const statusText = ret.statusText || "Return request received and being processed.";
-        const txnId = ret.refundTransactionId ? "\n• Transaction: " + ret.refundTransactionId : "";
-
-        return (
-          "Return / Refund Details for Order " + (orderWithReturn.razorpay_order_id || orderWithReturn.reservation_id) + ":\n" +
-          "• Return ID: " + returnId + "\n" +
-          "• Status: " + status + "\n" +
-          "• Amount: ₹" + refundAmt + txnId + "\n" +
-          "• Note: " + statusText + "\n\n" +
-          "Let me know if you need any additional info, or tap 'Chat to Customer Care' if you would like manual assistance."
-        );
-      }
-    } catch (e) {
-      console.error("[Bot] Return status check error:", e);
-    }
-    return (
-      "Eligible orders can request a 7-day doorstep size exchange or return directly from your account (/dashboard/orders).\n\n" +
-      "• Size Swaps: Our courier partner brings your calibrated replacement size and retrieves the initial piece in one doorstep interaction.\n" +
-      "• Return to Credit: Garments can also be converted to non-expiring store credit.\n\n" +
-      "Visit /dashboard/orders to initiate, or let me know if you have other questions!"
-    );
-  }
-
-  // 3. Order Tracking & Details
-  if (/\b(order|track|tracking|status|dispatch|delivery|where is my order|shipment|parcel|awb)\b/i.test(text) || /\b(ntb-[a-z0-9-]+|order_[a-z0-9]+)\b/i.test(text)) {
-    try {
-      const idMatch = text.match(/\b(order_[a-z0-9]+|ntb-[a-z0-9-]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
-      const orders = idMatch
-        ? [await orderByQuotedId(supabase, idMatch[1], user)].filter(Boolean)
-        : await ownOrders(supabase, user, 1);
-
-      if (orders.length > 0) {
-        const o = orders[0];
-        const meta = o.checkout_metadata || {};
-        const fulfillment = meta.fulfillmentStatus || (o.status === "committed" ? "Processing / Dispatched" : String(o.status).toUpperCase());
-        const trackingNum = meta.trackingNumber ? "\n• Tracking #: " + meta.trackingNumber : "";
-        const courier = meta.courier ? " (" + meta.courier + ")" : "";
-        
-        let itemList = "";
-        const rawItems = Array.isArray(o.items?.items) ? o.items.items : (Array.isArray(o.items) ? o.items : []);
-        if (rawItems.length > 0) {
-          itemList = "\n• Items: " + rawItems.map((i: any) => (i.name || i.sku) + " (" + (i.size || "STD") + " x" + (i.qty || 1) + ")").slice(0, 3).join(", ");
-        }
-
-        return (
-          "Here is your latest order status:\n" +
-          "• Order ID: " + (o.razorpay_order_id || o.reservation_id) + "\n" +
-          "• Status: " + fulfillment + courier + trackingNum + itemList + "\n\n" +
-          "You can view live tracking and download invoices from your Orders page (/dashboard/orders)."
-        );
-      }
-    } catch (e) {
-      console.error("[Bot] Order lookup error:", e);
-    }
-    return "I couldn't find an order on file matching that request. Please provide your Order ID (e.g. NTB-... or order_...) or check your Orders dashboard (/dashboard/orders).";
-  }
-
-  // 4. Sizing & Fit Guide
-  if (/\b(size|fit|sizing|measurement|chart|oversized|boxy|chest)\b/i.test(text)) {
-    return (
-      "Our garments feature an architectural boxy oversized fit engineered from heavyweight pure combed cotton.\n\n" +
-      "• True-to-Size: Delivers our intended drop-shoulder relaxed silhouette.\n" +
-      "• Fitted Look: If you prefer a tailored chest drape, we recommend sizing down one size.\n" +
-      "• Measurements: Exact flat-lay centimeters for chest, length, and shoulder are listed on every product page.\n\n" +
-      "Every drop is also covered by our 7-Day Doorstep Size Swap guarantee!"
-    );
-  }
-
-  // 5. Shipping Policy & Times
-  if (/\b(ship|shipping|courier|dispatch|free shipping|fee|how long|time|delivery)\b/i.test(text)) {
-    return (
-      "Shipping & Dispatch SLA:\n" +
-      "• Free Shipping: Orders ₹999 and above receive Free Express Dispatch across India.\n" +
-      "• Standard Dispatch Fee: Orders below ₹999 incur a flat ₹150 express dispatch fee.\n" +
-      "• Same-Day Dispatch: In-stock orders placed before 3:00 PM IST (Mon–Sat) are packed and dispatched the same day.\n" +
-      "• Delivery Window: Metro hubs take 24–48 hours; other locations take 3–5 business days via Blue Dart / Delhivery."
-    );
-  }
-
-  // 6. Fabric, GSM, Quality & Care
-  if (/\b(product|fabric|cotton|gsm|stock|available|price|sku|material|quality|wash|care)\b/i.test(text)) {
-    if (/\b(wash|care|dry|clean|iron)\b/i.test(text)) {
-      return (
-        "Garment Care for Heavyweight Cotton:\n" +
-        "• Wash: Cold machine wash (30°C max) inside out on gentle cycle.\n" +
-        "• Dry: Flat dry in shade. Avoid tumble drying to preserve fabric loft.\n" +
-        "• Iron: Warm iron inside out; never iron directly on screen prints or embroidery."
-      );
-    }
-    try {
-      const { data: products } = await supabase.schema("inventory").from("products")
-        .select("id,sku_prefix,name,color,category,fabric,gsm,status")
-        .in("status", ["ACTIVE", "LOW_STOCK"]).limit(100);
-      const match = (products ?? []).find((product: any) =>
-        text.includes(String(product.name).toLowerCase()) || text.includes(String(product.sku_prefix).toLowerCase())
-      );
-      if (match) {
-        const { data: variants } = await supabase.schema("inventory").from("stock_levels")
-          .select("size,price,available_qty").eq("product_id", match.id).order("size");
-        const stock = (variants ?? []).map((variant: any) =>
-          variant.size + ": ₹" + variant.price + (variant.available_qty > 0 ? " (" + variant.available_qty + " left)" : " (out of stock)")
-        ).join(", ");
-        const details = [match.color, match.fabric, match.gsm].filter(Boolean).join(" · ");
-        return match.name + (details ? " — " + details : "") + ". " + (stock ? "Available sizes: " + stock + "." : "");
-      }
-      const names = (products ?? []).slice(0, 6).map((p: any) => p.name).filter(Boolean);
-      return names.length
-        ? "Featured pieces: " + names.join(", ") + ". Send any piece name or SKU for live sizing and stock availability."
-        : "Our pieces are engineered from pure combed compact cotton with reinforced ribbed zero-sag collars.";
-    } catch (e) {
-      console.error("[Bot] Product lookup error:", e);
-    }
-    return "All Newtownbay pieces are crafted from heavyweight 100% combed compact cotton with double-needle construction and zero-sag collars.";
-  }
-
-  // 7. Coupons & Promotions
-  if (/\b(coupon|promo|discount|code|voucher|offer)\b/i.test(text)) {
-    return (
-      "Promotions & Discounts:\n" +
-      "• All orders ₹999 and above automatically qualify for Free Express Pan-India Shipping.\n" +
-      "• Seasonal drop discount codes can be applied directly at checkout in the promo code field.\n" +
-      "• If an order does not dispatch within our 48-hour SLA, you receive a ₹200 store credit voucher."
-    );
-  }
-
-  return null;
-}
-
 async function notifyAdmins(
   supabase: any,
   conversationId: string,
   customerName: string,
-  messageId: string
+  messageId: string,
+  preview: string,
+  needsHelp: boolean
 ) {
   const { data: admins } = await supabase.from("profiles").select("id").eq("role", "admin");
   if (!admins?.length) return;
+  const body = (customerName + ": " + preview).slice(0, 160);
   const notifications = admins.map((admin: { id: string }) => ({
     recipient_user_id: admin.id,
     type: "chat",
-    title: "New customer message",
-    body: customerName + ": requested customer care in support chat",
+    title: needsHelp ? "Customer needs help" : "New customer message",
+    body,
     entity_id: conversationId,
     dedupe_key: "chat:" + messageId + ":" + admin.id,
   }));
@@ -280,6 +66,28 @@ async function notifyAdmins(
     item.recipient_user_id,
     { title: item.title, body: item.body, entityId: item.entity_id }
   )));
+}
+
+/** Customer text as it should appear in an alert: one line, bounded length. */
+function preview(message: string): string {
+  return message.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+/** Raise the conversation in the admin queue and push it to every admin device. */
+async function queueForAdmin(
+  supabase: any,
+  conversation: any,
+  customerName: string,
+  messageText: string,
+  messageId: string,
+  needsHelp: boolean
+) {
+  await supabase.schema("orders").from("support_conversations").update({
+    admin_unread_count: (conversation.admin_unread_count ?? 0) + 1,
+    updated_at: new Date().toISOString(),
+  }).eq("id", conversation.id);
+
+  await notifyAdmins(supabase, conversation.id, customerName, messageId, preview(messageText), needsHelp);
 }
 
 export async function supportRoutes(app: FastifyInstance) {
@@ -307,14 +115,19 @@ export async function supportRoutes(app: FastifyInstance) {
     const user = await signedInUser(request, reply);
     if (!user) return;
     const supabase: any = createServiceClient();
-    const { data, error } = await supabase
-      .schema("orders")
-      .from("support_conversations")
-      .select("id,status,customer_unread_count,created_at,updated_at")
-      .eq("customer_user_id", user.id)
-      .order("updated_at", { ascending: false });
+    const [{ data, error }, adminsOnline] = await Promise.all([
+      supabase
+        .schema("orders")
+        .from("support_conversations")
+        .select("id,status,customer_unread_count,created_at,updated_at")
+        .eq("customer_user_id", user.id)
+        .order("updated_at", { ascending: false }),
+      // Sent so the chat header can say "no specialist online" instead of
+      // claiming an agent joined a conversation nobody has picked up.
+      isAdminOnline(supabase),
+    ]);
     if (error) throw error;
-    return reply.send({ data: data ?? [] });
+    return reply.send({ data: data ?? [], adminsOnline });
   });
 
   app.get<{ Params: { id: string } }>("/support/conversations/:id/messages", async (request, reply) => {
@@ -335,6 +148,21 @@ export async function supportRoutes(app: FastifyInstance) {
     return reply.send({ data: data ?? [] });
   });
 
+  /**
+   * One customer turn in the support chat.
+   *
+   * Answering rules, in order:
+   *   1. Conversation already handed off AND an admin is around  -> stay silent,
+   *      just notify. A human is handling it; the bot must not talk over them.
+   *   2. Out-of-scope question                                    -> canned refusal,
+   *      no rules, no model, no admin queue.
+   *   3. Otherwise the bot answers: deterministic rules first, then the model
+   *      when no rule matched.
+   *   4. No admin around -> the answer is still given, plus a follow-up promise,
+   *      and the conversation is pushed into the admin queue. Previously a
+   *      conversation that had once been handed off stayed silent forever, so a
+   *      customer messaging an offline admin got no reply at all.
+   */
   app.post("/support/messages", async (request, reply) => {
     const user = await signedInUser(request, reply);
     if (!user) return;
@@ -369,66 +197,79 @@ export async function supportRoutes(app: FastifyInstance) {
     }).select("id,sender_role,body,created_at").single();
     if (inserted.error) throw inserted.error;
 
-    const isAlreadyOpen = conversation.status === "open";
+    const messageId = inserted.data.id;
+    const adminsOnline = await isAdminOnline(supabase);
     const asksForPerson = /\b(agent|human|person|representative|concierge|admin|customer\s*care|care|support\s*team|talk\s*to\s*(someone|person|human|agent))\b/i.test(parsed.data.message);
 
-    // CASE 1: Conversation is ALREADY handed off to human/admin
-    if (isAlreadyOpen) {
-      await supabase.schema("orders").from("support_conversations").update({
-        admin_unread_count: (conversation.admin_unread_count ?? 0) + 1,
-        updated_at: new Date().toISOString(),
-      }).eq("id", conversation.id);
-
-      await notifyAdmins(supabase, conversation.id, customerName, inserted.data.id);
-      return reply.send({ conversationId: conversation.id, status: "open", data: [inserted.data] });
+    // CASE 1: Already handed off to a human who is currently around.
+    if (conversation.status === "open" && adminsOnline) {
+      await queueForAdmin(supabase, conversation, customerName, parsed.data.message, messageId, true);
+      return reply.send({ conversationId: conversation.id, status: "open", adminsOnline, data: [inserted.data] });
     }
 
-    // CASE 2: Customer specifically requests human Customer Care
-    if (asksForPerson) {
-      await supabase.schema("orders").from("support_conversations").update({
-        status: "open",
-        admin_unread_count: (conversation.admin_unread_count ?? 0) + 1,
-        updated_at: new Date().toISOString(),
-      }).eq("id", conversation.id);
-
-      await notifyAdmins(supabase, conversation.id, customerName, inserted.data.id);
-
-      const handoffText = "I have connected you with our human customer care team. A concierge specialist will reply to your message shortly.";
-
-      const handoff = await supabase.schema("orders").from("support_messages").insert({
-        conversation_id: conversation.id,
-        sender_role: "bot",
-        body: handoffText,
-      }).select("id,sender_role,body,created_at").single();
-      if (handoff.error) throw handoff.error;
-
-      return reply.send({ conversationId: conversation.id, status: "open", data: [inserted.data, handoff.data] });
+    // CASE 2: Out-of-scope question. Refused here, deterministically, so it costs
+    // nothing and cannot be argued with. Not queued for an admin: an off-topic
+    // message is not work for a human, and queuing it would drown the real ones.
+    // Still checked after asksForPerson, because a person request outranks scope.
+    if (!asksForPerson) {
+      const offTopic = offTopicReason(parsed.data.message);
+      if (offTopic) {
+        request.log.info({ reason: offTopic }, "concierge refused an out-of-scope message");
+        const refusal = await supabase.schema("orders").from("support_messages").insert({
+          conversation_id: conversation.id, sender_role: "bot", body: SCOPE_REPLY,
+        }).select("id,sender_role,body,created_at").single();
+        if (refusal.error) throw refusal.error;
+        await supabase.schema("orders").from("support_conversations")
+          .update({ updated_at: new Date().toISOString() }).eq("id", conversation.id);
+        return reply.send({
+          conversationId: conversation.id,
+          status: conversation.status,
+          adminsOnline,
+          data: [inserted.data, refusal.data],
+        });
+      }
     }
 
-    // CASE 3: Standard Bot Mode - provide answer or guidance without prematurely escalating to human
-    const answer = await faqAnswer(supabase, parsed.data.message, user);
+    // CASE 3: Bot answers. Rules first; the model only sees what no rule covers.
+    let answer = await ruleAnswer(supabase, parsed.data.message, user);
+    if (!answer) answer = await aiAnswer(supabase, user, parsed.data.message);
 
-    const botReplyText = answer || (
-      "I'm the Newtownbay AI Concierge 🤖. I specialize in:\n" +
-      "• 📦 Live order tracking and delivery status\n" +
-      "• 🔄 Doorstep size swaps (7-day window) & return policy\n" +
-      "• 📏 Sizing recommendations for our oversized boxy fit\n" +
-      "• 🧵 Heavyweight fabric specs (pure combed cotton)\n" +
-      "• 🚚 Express pan-India shipping & courier details\n\n" +
-      "Please let me know if you would like information on any of these topics, or select 'Chat to Customer Care' if you need personalized assistance from our team."
-    );
+    const refused = answer === SCOPE_REPLY;
+    const needsHuman = !answer;
+    let status: string = conversation.status;
+    let body = answer ?? MENU_REPLY;
 
-    await supabase.schema("orders").from("support_conversations").update({
-      updated_at: new Date().toISOString(),
-    }).eq("id", conversation.id);
+    if (asksForPerson && adminsOnline) {
+      status = "open";
+      body = body + "\n\n" + ONLINE_HANDOFF;
+    } else if (!adminsOnline) {
+      // Never leave a customer at a dead end: answer, promise follow-up, queue it.
+      // An out-of-scope refusal is not a dead end and needs no human — unless the
+      // customer asked for one, which outranks the refusal.
+      if (!refused || asksForPerson) {
+        if (needsHuman || asksForPerson) status = "open";
+        body = body + "\n\n" + FOLLOW_UP_LINE;
+      }
+    } else if (needsHuman) {
+      // Admin is around but the bot has nothing: this one needs a person.
+      status = "open";
+    }
+
+    const shouldNotifyAdmins = !refused && (!adminsOnline || status === "open");
+    if (shouldNotifyAdmins) {
+      await queueForAdmin(supabase, conversation, customerName, parsed.data.message, messageId, needsHuman || asksForPerson);
+    } else {
+      await supabase.schema("orders").from("support_conversations")
+        .update({ updated_at: new Date().toISOString() }).eq("id", conversation.id);
+    }
 
     const bot = await supabase.schema("orders").from("support_messages").insert({
       conversation_id: conversation.id,
       sender_role: "bot",
-      body: botReplyText,
+      body,
     }).select("id,sender_role,body,created_at").single();
     if (bot.error) throw bot.error;
 
-    return reply.send({ conversationId: conversation.id, status: "bot", data: [inserted.data, bot.data] });
+    return reply.send({ conversationId: conversation.id, status, adminsOnline, data: [inserted.data, bot.data] });
   });
 }
