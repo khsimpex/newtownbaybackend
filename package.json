@@ -11,7 +11,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "check:concierge": "tsx scripts/check-concierge.ts"
+    "check:concierge": "tsx scripts/check-concierge.ts",
+    "check:pricing": "tsx scripts/check-pricing.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.127.0",

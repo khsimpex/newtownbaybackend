@@ -38,8 +38,17 @@ export async function webhookRoutes(app: FastifyInstance) {
     const event = payload.event as string;
     const razorpayOrderId = payload.payload?.payment?.entity?.order_id as string | undefined;
     const razorpayPaymentId = payload.payload?.payment?.entity?.id as string | undefined;
+    // The captured amount rides along on the event so the price re-check in
+    // processPaymentEvent does not need a second Razorpay round-trip — and
+    // cannot silently skip because that call failed.
+    const capturedAmountPaise = Number(payload.payload?.payment?.entity?.amount);
 
-    const result = await processPaymentEvent(event, razorpayOrderId, razorpayPaymentId);
+    const result = await processPaymentEvent(
+      event,
+      razorpayOrderId,
+      razorpayPaymentId,
+      Number.isFinite(capturedAmountPaise) ? capturedAmountPaise : undefined
+    );
     return reply.send(result);
   });
 }

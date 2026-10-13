@@ -70,7 +70,7 @@ export type ReleaseResult =
   | { ok: true; status: "released" }
   | { ok: false; status: number; error: string };
 
-export type WebhookResult = { status: string };
+export type WebhookResult = { status: string; detail?: string; refundId?: string };
 
 type ReservedSku = { sku: string; qty: number };
 
@@ -137,6 +137,104 @@ function newReservationId(): string {
 
 function newSecret(): string {
   return crypto.randomBytes(24).toString("hex");
+}
+
+/**
+ * The single definition of what a cart costs, in paise.
+ *
+ * Both the quote at reservation time and the re-check at capture time call
+ * this. They must agree exactly, or every order looks repriced — so the
+ * shipping rule and rounding live here and nowhere else.
+ */
+export function quotedAmountInPaise(priced: { price: number; qty: number }[]): number {
+  const subtotal = priced.reduce((acc, i) => acc + i.price * i.qty, 0);
+  const shipping = subtotal >= 999 || subtotal === 0 ? 0 : 150;
+  return Math.round((subtotal + shipping) * 100);
+}
+
+/**
+ * What this cart costs right now, from live inventory prices, in paise.
+ *
+ * Returns null when a SKU no longer exists: the quoted price cannot be honoured
+ * for a product that is gone.
+ */
+async function currentAmountInPaise(
+  supabase: ReturnType<typeof createServiceClient>,
+  items: { sku: string; qty: number }[]
+): Promise<number | null> {
+  const live: { price: number; qty: number }[] = [];
+  for (const item of items) {
+    const found = await getAuthoritativeItem(supabase, item.sku);
+    if (!found) return null;
+    live.push({ price: found.price, qty: item.qty });
+  }
+  return quotedAmountInPaise(live);
+}
+
+/**
+ * Refund the captured amount, release the held stock, and mark the reservation
+ * released with the reason. Used when the price moved between the reservation
+ * and the capture, and the order must not stand.
+ *
+ * A failed refund is recorded on the row rather than thrown: the customer has
+ * been charged and stock must not stay locked either way, so the honest thing
+ * is to leave a visible marker the operator can act on.
+ */
+async function refundAndRelease(
+  supabase: ReturnType<typeof createServiceClient>,
+  reservation: { id: string; checkout_metadata?: unknown },
+  razorpayPaymentId: string | undefined,
+  items: { sku: string; qty: number }[],
+  reason: string
+): Promise<{ detail: string; refundId?: string }> {
+  let refundId: string | undefined;
+  let refundError: string | undefined;
+
+  if (razorpayPaymentId) {
+    try {
+      const razorpay = new Razorpay({
+        key_id: env.RAZORPAY_KEY_ID,
+        key_secret: env.RAZORPAY_KEY_SECRET,
+      });
+      const refund = await razorpay.payments.refund(razorpayPaymentId, { speed: "normal" });
+      refundId = refund.id;
+    } catch (err) {
+      refundError = err instanceof Error ? err.message : String(err);
+      console.error(
+        `CRITICAL: auto-refund failed for payment ${razorpayPaymentId}. Manual refund required.`,
+        refundError
+      );
+    }
+  } else {
+    refundError = "No payment id on the event";
+    console.error("CRITICAL: price mismatch but no payment id to refund against.");
+  }
+
+  for (const item of items) {
+    await releaseSku(supabase, item.sku, item.qty);
+  }
+
+  const existing =
+    reservation.checkout_metadata && typeof reservation.checkout_metadata === "object"
+      ? (reservation.checkout_metadata as Record<string, unknown>)
+      : {};
+
+  await supabase
+    .schema("orders")
+    .from("checkout_reservations")
+    .update({
+      status: "released",
+      checkout_metadata: {
+        ...existing,
+        paymentFailureReason: reason,
+        refundedAt: new Date().toISOString(),
+        ...(refundId ? { refundId } : {}),
+        ...(refundError ? { refundFailed: refundError } : {}),
+      },
+    })
+    .eq("id", reservation.id);
+
+  return { detail: reason, ...(refundId ? { refundId } : {}) };
 }
 
 /**
@@ -212,9 +310,7 @@ export async function createReservation(
     priced.push({ sku: req.sku, qty: req.qty, price: item.price, name: item.name });
   }
 
-  const subtotal = priced.reduce((acc, i) => acc + i.price * i.qty, 0);
-  const shipping = subtotal >= 999 || subtotal === 0 ? 0 : 150;
-  const amountInPaise = Math.round((subtotal + shipping) * 100);
+  const amountInPaise = quotedAmountInPaise(priced);
   const reservationId = newReservationId();
   const secret = newSecret();
 
@@ -305,6 +401,7 @@ export async function verifyPayment(
   // that this payment actually shows as captured. A signature alone proves
   // the payload wasn't tampered with in transit; it does not by itself
   // prove money moved, so we ask Razorpay's API for ground truth too.
+  let capturedAmount: number;
   try {
     const razorpay = new Razorpay({
       key_id: env.RAZORPAY_KEY_ID,
@@ -319,12 +416,33 @@ export async function verifyPayment(
         error: `Payment not captured (status: ${payment.status})`,
       };
     }
+
+    capturedAmount = Number(payment.amount);
   } catch (err) {
     console.error("Razorpay payment fetch failed during verify:", err);
     return { ok: false, status: 502, error: "Could not confirm payment with gateway" };
   }
 
-  const result = await processPaymentEvent("order.paid", razorpayOrderId, razorpayPaymentId);
+  const result = await processPaymentEvent(
+    "order.paid",
+    razorpayOrderId,
+    razorpayPaymentId,
+    capturedAmount
+  );
+
+  // The cart was repriced between reservation and capture. The money has been
+  // refunded and the order deliberately does not stand, so this must surface as
+  // a failure — returning ok would show the customer a success screen for an
+  // order that was just voided.
+  if (result.status === "refunded_price_changed") {
+    return {
+      ok: false,
+      status: 409,
+      error:
+        "The price of an item changed while you were paying. Your payment has been refunded in full and no order was placed — please order again at the updated price.",
+    };
+  }
+
   return { ok: true, status: result.status };
 }
 
@@ -384,7 +502,8 @@ export async function releaseReservation(
 export async function processPaymentEvent(
   event: string,
   razorpayOrderId: string | undefined,
-  razorpayPaymentId?: string
+  razorpayPaymentId?: string,
+  capturedAmountPaise?: number
 ): Promise<WebhookResult> {
   if (!razorpayOrderId) {
     return { status: "ignored_no_order_id" };
@@ -412,6 +531,52 @@ export async function processPaymentEvent(
   const items = claimed.items as { sku: string; qty: number }[];
 
   if (event === "order.paid") {
+    // -----------------------------------------------------------------------
+    // Price re-check before committing.
+    //
+    // The amount is locked when the reservation is created, but the admin can
+    // reprice a SKU while the customer is still sitting on the Razorpay
+    // window. Without this, the old figure is charged and the order still
+    // commits — the price change just silently loses money.
+    //
+    // The charge is already captured by the time either caller gets here, so
+    // "fail the payment" means refund it: money back, stock released, order
+    // does not stand.
+    // -----------------------------------------------------------------------
+    if (typeof capturedAmountPaise === "number") {
+      const expected = await currentAmountInPaise(supabase, items);
+
+      if (expected !== null && expected !== capturedAmountPaise) {
+        const reason = `Price changed during checkout: charged ${capturedAmountPaise / 100}, current total ${expected / 100}`;
+        const outcome = await refundAndRelease(
+          supabase,
+          claimed,
+          razorpayPaymentId,
+          items,
+          reason
+        );
+        return { status: "refunded_price_changed", ...outcome };
+      }
+
+      if (expected === null) {
+        const reason = "An item in this cart is no longer available at the quoted price";
+        const outcome = await refundAndRelease(
+          supabase,
+          claimed,
+          razorpayPaymentId,
+          items,
+          reason
+        );
+        return { status: "refunded_price_changed", ...outcome };
+      }
+    } else {
+      // Both callers supply the captured amount. Reaching here means a caller
+      // was added without it, and the price guard silently did not run.
+      console.error(
+        `WARNING: order.paid for ${razorpayOrderId} arrived with no captured amount — price re-check skipped.`
+      );
+    }
+
     for (const item of items) {
       await commitSku(supabase, item.sku, item.qty);
     }
